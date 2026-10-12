@@ -703,20 +703,11 @@ where
     V: ValueType + Float + FromF32,
     D: ScalarDenseSupportedDistance,
 {
-    let dataset_f32 = read_npy_f32::<D>(&args.data_file).unwrap_or_else(|e| {
+    // Streamed: peak memory is the converted dataset plus one chunk, not both full copies.
+    kannolo::npy::read_npy_f32_as::<V, D>(&args.data_file).unwrap_or_else(|e| {
         eprintln!("Error reading .npy file: {e:?}");
         process::exit(1);
-    });
-    let d = dataset_f32.input_dim();
-    let n_vecs = dataset_f32.len();
-    let data: Vec<V> = dataset_f32
-        .values()
-        .iter()
-        .map(|v| V::from_f32_saturating(*v))
-        .collect();
-
-    let encoder = PlainDenseQuantizer::<V, D>::new(d);
-    DenseDataset::from_raw(data.into_boxed_slice(), n_vecs, encoder)
+    })
 }
 
 fn build_sparse_plain<V, G>(args: &Args, distance: Distance, config: &HNSWBuildConfiguration)

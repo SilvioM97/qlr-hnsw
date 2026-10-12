@@ -31,6 +31,9 @@ use pyo3::prelude::PyModule;
 use pyo3::{Bound, PyResult, pymodule};
 
 pub mod graph;
+pub mod npy;
+pub mod catapult;
+pub mod qlr;
 pub mod utils;
 pub mod visited_set;
 

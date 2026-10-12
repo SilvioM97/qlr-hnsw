@@ -279,3 +279,4 @@ $RECYCLE.BIN/
 
 # Notebooks for personal tests
 /other_notebooks
+__pycache__/

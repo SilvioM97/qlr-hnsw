@@ -162,7 +162,7 @@ pub trait GraphTrait {
     {
         self.search_candidates_impl(
             dataset,
-            entry_node,
+            std::slice::from_ref(&entry_node),
             query_evaluator,
             ef_search,
             Some(k),
@@ -185,7 +185,7 @@ pub trait GraphTrait {
     {
         self.search_candidates_impl(
             dataset,
-            entry_node,
+            std::slice::from_ref(&entry_node),
             query_evaluator,
             ef_construction,
             None,
@@ -194,11 +194,17 @@ pub trait GraphTrait {
     }
 
     /// Shared implementation for candidate search.
+    ///
+    /// Accepts an arbitrary set of pre-scored entry nodes. With a single seed this is the
+    /// classical HNSW beam search; with multiple seeds it starts from a caller-provided frontier
+    /// (used by query-log routing, see [`crate::qlr`]). Duplicate seeds are deduplicated; if
+    /// more seeds than `ef` are given, the worst are evicted from the result heap on admission
+    /// but every seed is still expanded.
     #[must_use]
     fn search_candidates_impl<'e, D>(
         &self,
         dataset: &'e D,
-        entry_node: ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>,
+        entry_nodes: &[ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>],
         query_evaluator: &<D::Encoder as VectorEncoder>::Evaluator<'e>,
         ef: usize,
         k: Option<usize>,
@@ -216,19 +222,26 @@ pub trait GraphTrait {
         // min-heap: We want to extract best candidate first to visit it
         let mut candidates: BinaryHeap<
             Reverse<ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>>,
-        > = BinaryHeap::with_capacity(ef);
+        > = BinaryHeap::with_capacity(ef.max(entry_nodes.len()));
 
-        let mut visited_table = create_visited_set(ef, lambda, self.n_nodes());
+        let mut visited_table =
+            create_visited_set(ef.max(entry_nodes.len()), lambda, self.n_nodes());
 
         // Scratch for `neighbors`, reused for every expanded node. The slice it backs is walked
         // twice, to prefetch and to score: producing the list twice would make the compressed
         // backend decode the StreamVByte block again, interleaved with the dataset accesses.
         let mut neighbors_buf: Vec<u32> = Vec::new();
 
-        top_candidates.push(entry_node);
-        candidates.push(Reverse(entry_node));
-
-        visited_table.insert(entry_node.vector);
+        for &seed in entry_nodes {
+            if !visited_table.insert(seed.vector) {
+                continue;
+            }
+            candidates.push(Reverse(seed));
+            top_candidates.push(seed);
+            if top_candidates.len() > ef {
+                top_candidates.pop();
+            }
+        }
 
         while let Some(Reverse(node)) = candidates.pop() {
             let id_candidate = node.vector;

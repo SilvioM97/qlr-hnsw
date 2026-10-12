@@ -854,6 +854,160 @@ where
 
 impl<D, G> HNSW<D, G>
 where
+    D: Dataset + Sync,
+    <D::Encoder as VectorEncoder>::Distance: vectorium::distances::Distance,
+    G: GraphTrait,
+{
+    /// Exact distances from `query` to the vectors `ids` (deduplicated), sorted best-first.
+    ///
+    /// Used by query-log routing (see [`crate::qlr`]) to score the candidate entry points pulled
+    /// from the log before deciding whether to route. Ids are dataset (external) ids.
+    pub fn score_ids<'q>(
+        &'q self,
+        query: <D::Encoder as VectorEncoder>::QueryVector<'q>,
+        ids: &[VectorId],
+        query_params: &<D::Encoder as VectorEncoder>::QueryParams,
+    ) -> Vec<vectorium::dataset::ScoredVector<<D::Encoder as VectorEncoder>::Distance>> {
+        let query_eval = self.dataset.encoder().query_evaluator(query, query_params);
+        let mut seen: HashSet<VectorId> = HashSet::with_capacity(ids.len());
+        let mut scored: Vec<vectorium::dataset::ScoredVector<_>> = ids
+            .iter()
+            .filter(|&&id| seen.insert(id))
+            .map(|&id| ScoredItemGeneric {
+                distance: query_eval.compute_distance(self.dataset.get(id)),
+                vector: id,
+            })
+            .collect();
+        scored.sort_unstable();
+        scored
+    }
+
+    /// The default ground-level entry of `query`: the greedy descent through the upper levels
+    /// that [`Index::search`] performs before its ground-level beam search. Used as the analog
+    /// of DiskANN's medoid when other seeds are added to it (see [`crate::catapult`]).
+    pub fn ground_entry<'q>(
+        &'q self,
+        query: <D::Encoder as VectorEncoder>::QueryVector<'q>,
+        query_params: &<D::Encoder as VectorEncoder>::QueryParams,
+    ) -> vectorium::dataset::ScoredVector<<D::Encoder as VectorEncoder>::Distance> {
+        debug_assert!(self.original_ids.is_none(), "requires an index without ground-level reordering");
+        let query_eval = self.dataset.encoder().query_evaluator(query, query_params);
+        let num_levels = self.levels.len();
+        let entry_graph = &self.levels[0];
+        let entry_external_id = entry_graph.get_external_id(self.entry_point) as VectorId;
+        let mut entry_node = ScoredItemGeneric {
+            distance: query_eval.compute_distance(self.dataset.get(entry_external_id)),
+            vector: self.entry_point,
+        };
+        if num_levels == 1 {
+            return vectorium::dataset::ScoredVector { distance: entry_node.distance, vector: entry_external_id };
+        }
+        for level_graph in &self.levels[..num_levels - 1] {
+            entry_node = level_graph.greedy_search_nearest(&self.dataset, &query_eval, entry_node);
+        }
+        vectorium::dataset::ScoredVector {
+            distance: entry_node.distance,
+            vector: self.level1_to_level0_mapping[entry_node.vector] as VectorId,
+        }
+    }
+
+    /// Approximate nearest-neighbor search on the ground level only, seeded by an arbitrary set
+    /// of entry-point ids. Does **not** descend the upper levels.
+    ///
+    /// Seeds are re-scored here; use
+    /// [`Self::search_from_scored_seeds`] to reuse distances already computed by
+    /// [`Self::score_ids`]. Duplicate ids are deduplicated; empty `entry_ids` returns nothing.
+    ///
+    /// Only valid for indexes whose ground level was not reordered (`original_ids` is `None`),
+    /// since entry ids are taken as ground-level local ids.
+    pub fn search_from_entry_points<'q>(
+        &'q self,
+        query: <D::Encoder as VectorEncoder>::QueryVector<'q>,
+        entry_ids: &[VectorId],
+        k: usize,
+        search_params: &HNSWSearchConfiguration<<D::Encoder as VectorEncoder>::QueryParams>,
+    ) -> Vec<vectorium::dataset::ScoredVector<<D::Encoder as VectorEncoder>::Distance>> {
+        if entry_ids.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let query_eval = self
+            .dataset
+            .encoder()
+            .query_evaluator(query, &search_params.query_params);
+        let mut seen: HashSet<VectorId> = HashSet::with_capacity(entry_ids.len());
+        let seeds: Vec<ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>> =
+            entry_ids
+                .iter()
+                .filter(|&&id| seen.insert(id))
+                .map(|&id| ScoredItemGeneric {
+                    distance: query_eval.compute_distance(self.dataset.get(id)),
+                    vector: id as usize,
+                })
+                .collect();
+        self.ground_search_from_seeds(&query_eval, &seeds, k, search_params)
+    }
+
+    /// Like [`Self::search_from_entry_points`], but takes seeds already scored against `query`
+    /// (e.g. the output of [`Self::score_ids`]), so their distances are not recomputed.
+    pub fn search_from_scored_seeds<'q>(
+        &'q self,
+        query: <D::Encoder as VectorEncoder>::QueryVector<'q>,
+        seeds: &[vectorium::dataset::ScoredVector<<D::Encoder as VectorEncoder>::Distance>],
+        k: usize,
+        search_params: &HNSWSearchConfiguration<<D::Encoder as VectorEncoder>::QueryParams>,
+    ) -> Vec<vectorium::dataset::ScoredVector<<D::Encoder as VectorEncoder>::Distance>> {
+        if seeds.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let query_eval = self
+            .dataset
+            .encoder()
+            .query_evaluator(query, &search_params.query_params);
+        let seeds: Vec<ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>> = seeds
+            .iter()
+            .map(|sv| ScoredItemGeneric {
+                distance: sv.distance,
+                vector: sv.vector as usize,
+            })
+            .collect();
+        self.ground_search_from_seeds(&query_eval, &seeds, k, search_params)
+    }
+
+    fn ground_search_from_seeds<'e>(
+        &'e self,
+        query_eval: &<D::Encoder as VectorEncoder>::Evaluator<'e>,
+        seeds: &[ScoredItemGeneric<<D::Encoder as VectorEncoder>::Distance, usize>],
+        k: usize,
+        search_params: &HNSWSearchConfiguration<<D::Encoder as VectorEncoder>::QueryParams>,
+    ) -> Vec<vectorium::dataset::ScoredVector<<D::Encoder as VectorEncoder>::Distance>> {
+        debug_assert!(
+            self.original_ids.is_none(),
+            "seeded search requires an index without ground-level reordering"
+        );
+        let ground_graph = &self.levels[self.levels.len() - 1];
+        let ef = search_params.ef_search.max(k);
+        let lambda = search_params.early_termination.lambda();
+        let top_heap =
+            ground_graph.search_candidates_impl(&self.dataset, seeds, query_eval, ef, Some(k), lambda);
+        let mut topk = top_heap.into_sorted_vec();
+        topk.truncate(k);
+        topk.drain(..)
+            .map(|candidate| vectorium::dataset::ScoredVector {
+                distance: candidate.distance,
+                vector: candidate.vector as VectorId,
+            })
+            .collect()
+    }
+
+    /// The dataset the index is built upon.
+    #[must_use]
+    pub fn dataset(&self) -> &D {
+        &self.dataset
+    }
+}
+
+impl<D, G> HNSW<D, G>
+where
     D: Dataset + Sync + SpaceUsage,
     <D::Encoder as VectorEncoder>::Distance: vectorium::distances::Distance,
     G: GraphTrait + From<GrowableGraph>,

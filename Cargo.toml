@@ -12,6 +12,7 @@ readme = "README.md"
 serde       = { version = "1.0.219", features = ["derive"] }
 rand        = "0.8.5"
 itertools   = "0.14.0"
+libc        = "0.2"
 matrixmultiply = "0.3.8"
 num-traits  = "0.2.18"
 byteorder   = "1.5.0"
@@ -67,6 +68,21 @@ required-features = ["cli"]
 [[bin]]
 name = "ivf_search"
 path = "src/bin/ivf_search.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "qlr_build"
+path = "src/bin/qlr_build.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "qlr_search"
+path = "src/bin/qlr_search.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "kmeans_centroids"
+path = "src/bin/kmeans_centroids.rs"
 required-features = ["cli"]
 
 [lib]
