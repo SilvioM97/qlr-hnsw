@@ -280,3 +280,8 @@ $RECYCLE.BIN/
 # Notebooks for personal tests
 /other_notebooks
 __pycache__/
+
+# the reproduction pipeline is made of shell scripts
+!reproduce/*.sh
+!reproduce/tests/*.sh
+!reproduce/configs/*.csv

@@ -9,7 +9,8 @@
 //!
 //! Modes:
 //! - `hnsw`:   plain HNSW over `--ef-list`.
-//! - `qlr`:    routed search over `--kprime-list x --th-list x --ef-list x adaptive`.
+//! - `qlr`:    routed search over `--kprime-list x --th-list x --ef-list x adaptive`, or over the
+//!   configurations listed in `--configs-file`.
 //! - `window`: E4. The router is the last `w` stream queries before each test query
 //!   (`--stream`, `--test-stream-pos`), with EP built on the fly by searching `I_D`. The
 //!   projection and `s_max` come from `--router` (the global one).
@@ -98,6 +99,11 @@ struct Args {
     /// Minimum beam width(s) of the adaptive scheme.
     #[clap(long, value_delimiter = ',', default_value = "10")]
     ef_min_list: Vec<usize>,
+    /// Run exactly the configurations listed in this CSV (header included) instead of the cross
+    /// product of the lists. `qlr`: columns `k_prime,th,ef,ef_min,adaptive` (empty `ef_min` =
+    /// default, empty `adaptive` = true); `catapult`: `lsh_bits,bucket_size,warmup,entry,ef`.
+    #[clap(long)]
+    configs_file: Option<String>,
     #[clap(long, value_enum, default_value_t = Action::Search)]
     action: Action,
     /// Reuse routing distances as seed distances (identical results, faster).
@@ -157,6 +163,16 @@ struct Args {
 }
 
 const HEADER: &str = "experiment,dataset,method,config,k_prime,ep_per_query,th,ef,adaptive,action,w,accuracy,mean_latency_us,hit_rate,mean_router_us,mean_proj_us,mean_iq_us,mean_score_us,mean_beam_us,mean_ef_used,mean_seeds,n_queries,ef_min";
+
+/// Rows of a CSV file with a header, as column name -> value.
+fn read_config_rows(path: &str) -> Vec<std::collections::HashMap<String, String>> {
+    let f = BufReader::new(File::open(path).unwrap_or_else(|e| panic!("opening {path}: {e}")));
+    let mut lines = f.lines().map(|l| l.expect("reading configs file")).filter(|l| !l.trim().is_empty());
+    let header: Vec<String> = lines.next().expect("empty configs file").split(',').map(|c| c.trim().to_string()).collect();
+    lines
+        .map(|l| header.iter().cloned().zip(l.split(',').map(|v| v.trim().to_string())).collect())
+        .collect()
+}
 
 fn read_gt(path: &str, k: usize) -> Vec<Vec<u64>> {
     let f = BufReader::new(File::open(path).expect("opening gt"));
@@ -369,51 +385,66 @@ fn main() {
             let router = router.as_ref().expect("--router is required for --mode qlr");
             let epq = args.ep_per_query.unwrap_or(router.ep.k_ep);
             let mut scratch = Vec::new();
-            for &kp in &args.kprime_list {
-                for &th in &args.th_list {
-                    for &adaptive in &adaptive_list {
-                        // In cache mode ef only drives the fallback search of unrouted queries.
-                        for &ef_min in &args.ef_min_list {
-                        // ef_min = 10 keeps the config names of the runs made before it was a knob.
-                        let efm = if ef_min == kannolo::qlr::EF_MIN { String::new() } else { format!("_efmin{ef_min}") };
-                        for &ef in &args.ef_list {
-                            let p = QlrParams {
-                                k_prime: kp,
-                                ep_per_query: epq,
-                                ef,
-                                th,
-                                adaptive,
-                                ef_min,
-                                reuse_seed_scores: args.reuse_seed_scores,
-                                action,
-                            };
-                            runner.run(
-                                Row {
-                                    config: format!(
-                                        "qlr_kp{kp}_epq{epq}_th{th}_ef{ef}{efm}_ad{}_{action_s}",
-                                        adaptive as u8
-                                    ),
-                                    k_prime: kp.to_string(),
-                                    ep_per_query: epq.to_string(),
-                                    th: th.to_string(),
-                                    ef,
-                                    adaptive: adaptive.to_string(),
-                                    action: action_s.clone(),
-                                    w: String::new(),
-                                    ef_min,
-                                },
-                                |qi, st| {
-                                    router
-                                        .search(&doc, q(qi), args.k, &p, &mut scratch, st)
-                                        .into_iter()
-                                        .map(|sv| sv.vector)
-                                        .collect()
-                                },
-                            );
-                        }
+            // The configurations: the cross product of the lists, or exactly those of the file.
+            // In cache mode ef only drives the fallback search of unrouted queries.
+            let mut cfgs: Vec<(usize, f32, bool, usize, usize)> = Vec::new(); // k', th, adaptive, ef_min, ef
+            if let Some(path) = &args.configs_file {
+                for r in read_config_rows(path) {
+                    let get = |k: &str| r.get(k).map(String::as_str).unwrap_or("");
+                    cfgs.push((
+                        get("k_prime").parse().expect("k_prime"),
+                        get("th").parse().expect("th"),
+                        !matches!(get("adaptive"), "false" | "0"),
+                        get("ef_min").parse().unwrap_or(kannolo::qlr::EF_MIN),
+                        get("ef").parse().expect("ef"),
+                    ));
+                }
+            } else {
+                for &kp in &args.kprime_list {
+                    for &th in &args.th_list {
+                        for &adaptive in &adaptive_list {
+                            for &ef_min in &args.ef_min_list {
+                                for &ef in &args.ef_list {
+                                    cfgs.push((kp, th, adaptive, ef_min, ef));
+                                }
+                            }
                         }
                     }
                 }
+            }
+            for (kp, th, adaptive, ef_min, ef) in cfgs {
+                // ef_min = 10 keeps the config names of the runs made before it was a knob.
+                let efm = if ef_min == kannolo::qlr::EF_MIN { String::new() } else { format!("_efmin{ef_min}") };
+                let p = QlrParams {
+                    k_prime: kp,
+                    ep_per_query: epq,
+                    ef,
+                    th,
+                    adaptive,
+                    ef_min,
+                    reuse_seed_scores: args.reuse_seed_scores,
+                    action,
+                };
+                runner.run(
+                    Row {
+                        config: format!("qlr_kp{kp}_epq{epq}_th{th}_ef{ef}{efm}_ad{}_{action_s}", adaptive as u8),
+                        k_prime: kp.to_string(),
+                        ep_per_query: epq.to_string(),
+                        th: th.to_string(),
+                        ef,
+                        adaptive: adaptive.to_string(),
+                        action: action_s.clone(),
+                        w: String::new(),
+                        ef_min,
+                    },
+                    |qi, st| {
+                        router
+                            .search(&doc, q(qi), args.k, &p, &mut scratch, st)
+                            .into_iter()
+                            .map(|sv| sv.vector)
+                            .collect()
+                    },
+                );
             }
         }
         Mode::Window => {
@@ -513,80 +544,100 @@ fn main() {
                 let best = (0..n).map(|i| router.ep.entries(i, 1).next().expect("empty EP row") as u64).collect();
                 (v, best)
             });
-            for &bits in &args.lsh_bits_list {
-                let log_hash: Option<Vec<usize>> = log.as_ref().map(|(v, _)| {
-                    let c = Catapults::new(dim, bits, 1, args.lsh_seed);
-                    v.chunks_exact(dim).map(|x| c.hash(x)).collect()
-                });
-                for &cap in &args.bucket_size_list {
-                    for warm in &args.catapult_warmup_list {
-                        for entry_mode in &args.catapult_entry_list {
-                            let descent = match entry_mode.as_str() {
-                                "descent" => true,
-                                "fallback" => false,
-                                m => panic!("unknown catapult entry mode {m}"),
-                            };
-                            for &ef in &args.ef_list {
-                                let mut cat = Catapults::new(dim, bits, cap, args.lsh_seed);
-                                match warm.as_str() {
-                                    "none" => {}
-                                    "log" => {
-                                        let (_, best) = log.as_ref().expect("--log-file is required for the log warm-up");
-                                        for (&h, &d) in log_hash.as_ref().unwrap().iter().zip(best) {
-                                            cat.insert(h, d);
-                                        }
-                                    }
-                                    w => panic!("unknown warm-up {w}"),
+            // The configurations: the cross product of the lists, or exactly those of the file.
+            let mut cfgs: Vec<(usize, usize, String, String, usize)> = Vec::new(); // bits, b, warm-up, entry, ef
+            if let Some(path) = &args.configs_file {
+                for r in read_config_rows(path) {
+                    let get = |k: &str| r.get(k).cloned().unwrap_or_default();
+                    cfgs.push((
+                        get("lsh_bits").parse().expect("lsh_bits"),
+                        get("bucket_size").parse().expect("bucket_size"),
+                        get("warmup"),
+                        get("entry"),
+                        get("ef").parse().expect("ef"),
+                    ));
+                }
+            } else {
+                for &bits in &args.lsh_bits_list {
+                    for &cap in &args.bucket_size_list {
+                        for warm in &args.catapult_warmup_list {
+                            for entry_mode in &args.catapult_entry_list {
+                                for &ef in &args.ef_list {
+                                    cfgs.push((bits, cap, warm.clone(), entry_mode.clone(), ef));
                                 }
-                                let cfg = HNSWSearchConfiguration::default().with_ef_search(ef);
-                                runner.run(
-                                    Row {
-                                        config: format!("cat_L{bits}_b{cap}_warm{warm}_{entry_mode}_ef{ef}"),
-                                        k_prime: bits.to_string(),
-                                        ep_per_query: cap.to_string(),
-                                        th: warm.clone(),
-                                        ef,
-                                        adaptive: String::new(),
-                                        action: entry_mode.clone(),
-                                        w: String::new(),
-                                        ef_min: 0,
-                                    },
-                                    |qi, st| {
-                                        let query = q(qi);
-                                        let qv = DenseVectorView::new(query);
-                                        let t = Instant::now();
-                                        let h = cat.hash(query);
-                                        st.proj_ns = t.elapsed().as_nanos() as u64;
-                                        // Seeds: the bucket's catapults, plus HNSW's default entry
-                                        // (always with `descent`, only for empty buckets with `fallback`).
-                                        let t = Instant::now();
-                                        let ids: Vec<u64> = cat.bucket(h).iter().copied().collect();
-                                        let mut seeds = doc.score_ids(qv, &ids, &());
-                                        if descent || seeds.is_empty() {
-                                            let entry = doc.ground_entry(qv, &());
-                                            if !seeds.iter().any(|sv| sv.vector == entry.vector) {
-                                                seeds.push(entry);
-                                            }
-                                        }
-                                        st.score_ns = t.elapsed().as_nanos() as u64;
-                                        st.routed = !ids.is_empty();
-                                        st.n_seeds = seeds.len();
-                                        st.ef_used = ef;
-                                        let t = Instant::now();
-                                        let res = doc.search_from_scored_seeds(qv, &seeds, args.k, &cfg);
-                                        st.beam_ns = t.elapsed().as_nanos() as u64;
-                                        // Online update, inside the timed region.
-                                        if let Some(best) = res.first() {
-                                            cat.insert(h, best.vector);
-                                        }
-                                        res.into_iter().map(|sv| sv.vector).collect()
-                                    },
-                                );
-                                println!("[qlr_search]   occupied buckets {} / {}", cat.occupied(), 1usize << bits);
                             }
                         }
                     }
                 }
+            }
+            // Hash codes of the log queries, per number of hyperplanes (computed when first needed).
+            let mut log_hashes: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+            for (bits, cap, warm, entry_mode, ef) in cfgs {
+                let descent = match entry_mode.as_str() {
+                    "descent" => true,
+                    "fallback" => false,
+                    m => panic!("unknown catapult entry mode {m}"),
+                };
+                let mut cat = Catapults::new(dim, bits, cap, args.lsh_seed);
+                match warm.as_str() {
+                    "none" => {}
+                    "log" => {
+                        let (v, best) = log.as_ref().expect("--log-file is required for the log warm-up");
+                        let hashes = log_hashes.entry(bits).or_insert_with(|| {
+                            let c = Catapults::new(dim, bits, 1, args.lsh_seed);
+                            v.chunks_exact(dim).map(|x| c.hash(x)).collect()
+                        });
+                        for (&h, &d) in hashes.iter().zip(best) {
+                            cat.insert(h, d);
+                        }
+                    }
+                    w => panic!("unknown warm-up {w}"),
+                }
+                let cfg = HNSWSearchConfiguration::default().with_ef_search(ef);
+                runner.run(
+                    Row {
+                        config: format!("cat_L{bits}_b{cap}_warm{warm}_{entry_mode}_ef{ef}"),
+                        k_prime: bits.to_string(),
+                        ep_per_query: cap.to_string(),
+                        th: warm.clone(),
+                        ef,
+                        adaptive: String::new(),
+                        action: entry_mode.clone(),
+                        w: String::new(),
+                        ef_min: 0,
+                    },
+                    |qi, st| {
+                        let query = q(qi);
+                        let qv = DenseVectorView::new(query);
+                        let t = Instant::now();
+                        let h = cat.hash(query);
+                        st.proj_ns = t.elapsed().as_nanos() as u64;
+                        // Seeds: the bucket's catapults, plus HNSW's default entry
+                        // (always with `descent`, only for empty buckets with `fallback`).
+                        let t = Instant::now();
+                        let ids: Vec<u64> = cat.bucket(h).iter().copied().collect();
+                        let mut seeds = doc.score_ids(qv, &ids, &());
+                        if descent || seeds.is_empty() {
+                            let entry = doc.ground_entry(qv, &());
+                            if !seeds.iter().any(|sv| sv.vector == entry.vector) {
+                                seeds.push(entry);
+                            }
+                        }
+                        st.score_ns = t.elapsed().as_nanos() as u64;
+                        st.routed = !ids.is_empty();
+                        st.n_seeds = seeds.len();
+                        st.ef_used = ef;
+                        let t = Instant::now();
+                        let res = doc.search_from_scored_seeds(qv, &seeds, args.k, &cfg);
+                        st.beam_ns = t.elapsed().as_nanos() as u64;
+                        // Online update, inside the timed region.
+                        if let Some(best) = res.first() {
+                            cat.insert(h, best.vector);
+                        }
+                        res.into_iter().map(|sv| sv.vector).collect()
+                    },
+                );
+                println!("[qlr_search]   occupied buckets {} / {}", cat.occupied(), 1usize << bits);
             }
         }
     }

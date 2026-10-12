@@ -91,6 +91,24 @@ timed runs dominate the total running time (a full grid on one core takes hours 
 MS MARCO v2 needs about 370 GB of RAM to build its index (about 320 GB on disk), and its ground
 truth is bound by reading the 567 GB `docs.npy`.
 
+### Selected configurations
+
+The grids are not needed to obtain the numbers of the tables. `reproduce/configs/` lists, for each
+dataset, the fastest configuration found by the grids at each Accuracy@10 target:
+
+- `e1_best.csv`: HNSW (`ef`) and QLR-HNSW (`k_prime`, `th`, `ef`, `ef_min`) for every dataset
+  and for the targets used in the tables and in the text; `accuracy` is the Accuracy@10 of that
+  configuration in our runs.
+- `ablation_best.csv`: the seeding-only (fixed `ef`), entry-set and CatapultDB (`lsh_bits`,
+  `bucket_size`, `warmup`, `entry`, `ef`) configurations on `snowflake` and `mda`, at 94, 96 and 98%.
+
+`MODE=best reproduce/run_all.sh` builds the indexes and routers as above and then runs only these
+configurations (`run.sh best <dataset>` for one dataset), writing `results/best_e1.csv` and
+`results/best_ablation.csv`. The same configurations can be given to the binary directly:
+`qlr_search --configs-file <csv>` runs exactly the rows of a CSV (`qlr` mode: columns
+`k_prime,th,ef,ef_min,adaptive`; `catapult` mode: `lsh_bits,bucket_size,warmup,entry,ef`) instead
+of the cross product of the `--*-list` options. Without `MODE=best`, `run_all.sh` runs the grids.
+
 Timing rules:
 
 - Timed runs are single-threaded and pinned with `numactl --physcpubind=$TIMING_CPU`. Their
@@ -106,6 +124,7 @@ Timing rules:
 - `results/*.csv`: one row per configuration (accuracy, mean latency, routing statistics),
   one file per experiment: `e1_main.csv` (HNSW and QLR-HNSW), `e2_ablation.csv`,
   `e3_sources.csv`, `e4_window.csv`, `e6_logsize.csv`, `e8_cache.csv`, `e10_catapult.csv`.
+- `results/best_e1.csv`, `results/best_ablation.csv`: the selected configurations (`MODE=best`).
 - `results/perquery/`: per-query statistics (recall, latency breakdown) of the E1 runs.
 - `results/e9_leakage.json`: the leakage check.
 - `indexes/`, `logs/`: the indexes and routers, and the logs of every step.
